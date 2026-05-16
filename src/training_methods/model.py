@@ -61,15 +61,21 @@ class GatedDeltaLayer(nn.Module):
         if state is None:
             state = x.new_zeros(batch, self.to_candidate.out_features)
 
-        outputs: list[torch.Tensor] = []
+        # Batch all input-side projections across timesteps to fold ~3 linear ops
+        # × T kernel launches into 3 batched matmuls. The state update remains
+        # sequential, and to_output must wait for state, so they stay in the loop.
+        h_all = self.norm(x)
+        candidates = torch.tanh(self.to_candidate(h_all))           # [B, T, d_state]
+        write_gates = torch.sigmoid(self.to_gate(h_all))            # [B, T, d_state]
+        residual_scales = torch.sigmoid(self.residual_gate(x))      # [B, T, d_model]
+
+        states: list[torch.Tensor] = []
         for t in range(seq_len):
-            h = self.norm(x[:, t])
-            candidate = torch.tanh(self.to_candidate(h))
-            write_gate = torch.sigmoid(self.to_gate(h))
-            state = state + write_gate * (candidate - state)
-            residual_scale = torch.sigmoid(self.residual_gate(x[:, t]))
-            outputs.append(x[:, t] + residual_scale * self.to_output(state))
-        return torch.stack(outputs, dim=1), state
+            state = state + write_gates[:, t] * (candidates[:, t] - state)
+            states.append(state)
+        states_seq = torch.stack(states, dim=1)                      # [B, T, d_state]
+        outputs = x + residual_scales * self.to_output(states_seq)
+        return outputs, state
 
 
 class FiLMBroadcast(nn.Module):

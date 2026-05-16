@@ -100,15 +100,18 @@ class CompressedBackwardLinear(nn.Module):
         self.register_buffer("ema_energy", torch.zeros(out_features))
         self.register_buffer("random_basis", self._make_random_basis(out_features, self.rank))
         self.register_buffer("cached_basis", torch.empty(0))
-        self.register_buffer("basis_age", torch.zeros((), dtype=torch.long))
         self.reset_parameters()
         self.last_active_fraction = 1.0
         self.last_dense_backward_flops = 0
         self.last_indexed_backward_flops = 0
         self.register_buffer("selection_counts", torch.zeros(out_features))
-        self.register_buffer("selection_steps", torch.zeros((), dtype=torch.long))
-        self.register_buffer("last_selection_mask", torch.zeros(out_features, dtype=torch.bool))
         self.register_buffer("row_grad_mass", torch.zeros(out_features))
+        # Hot-path bookkeeping kept as Python ints to avoid GPU↔CPU sync per forward.
+        self._selection_steps = 0
+        self._basis_age = 0
+        self._turnover_acc = 0.0
+        self._turnover_n = 0
+        self._last_selection_idx: torch.Tensor | None = None
         self.last_turnover = 0.0
 
     def reset_parameters(self):
@@ -133,16 +136,17 @@ class CompressedBackwardLinear(nn.Module):
             score = self.ema_energy
         else:
             score = energy
-        idx = score.topk(self.rank).indices.sort().values
+        # topk indices need no .sort(); index_select/index_copy_ don't require ordering.
+        idx = score.topk(self.rank).indices
         self.last_active_fraction = float(self.rank / self.out_features)
-        mask = torch.zeros(self.out_features, device=y.device, dtype=torch.bool)
-        mask[idx] = True
-        if self.selection_steps.item() > 0:
-            overlap = (mask & self.last_selection_mask.to(mask.device)).sum().item()
-            self.last_turnover = 1.0 - overlap / max(1, self.rank)
-        self.selection_counts.add_(mask.to(self.selection_counts.dtype))
-        self.selection_steps.add_(1)
-        self.last_selection_mask.copy_(mask)
+        # Update selection histogram on-device without materializing a bool mask.
+        self.selection_counts.index_add_(
+            0, idx, torch.ones_like(idx, dtype=self.selection_counts.dtype)
+        )
+        self._selection_steps += 1
+        # Turnover is a diagnostic — store the previous idx as a tensor reference and
+        # let selection_stats() compute it on demand (no per-step .item() sync).
+        self._last_selection_idx = idx
         return idx
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -169,11 +173,11 @@ class CompressedBackwardLinear(nn.Module):
             return self.random_basis.to(device=y.device, dtype=y.dtype)
         if (
             self.cached_basis.numel()
-            and self.basis_age.item() < self.basis_refresh_every
+            and self._basis_age < self.basis_refresh_every
             and self.cached_basis.device == y.device
             and self.cached_basis.dtype == y.dtype
         ):
-            self.basis_age.add_(1)
+            self._basis_age += 1
             return self.cached_basis
         flat_y = y.detach().reshape(-1, y.shape[-1])
         centered = flat_y - flat_y.mean(dim=0, keepdim=True)
@@ -193,7 +197,7 @@ class CompressedBackwardLinear(nn.Module):
                 _, evecs = torch.linalg.eigh(cov)
             result = evecs[:, -self.rank :]
         self.cached_basis = result
-        self.basis_age.zero_()
+        self._basis_age = 0
         return result
 
     def theoretical_optimizer_state_ratio(self) -> float:
@@ -201,7 +205,7 @@ class CompressedBackwardLinear(nn.Module):
         return 1.0
 
     def selection_stats(self) -> tuple[float, float, float, float]:
-        if self.selection_steps.item() == 0:
+        if self._selection_steps == 0:
             return 0.0, 0.0, 0.0, 0.0
         coverage = self.selection_counts.gt(0).float().mean().item()
         probs = self.selection_counts / self.selection_counts.sum().clamp_min(1)
