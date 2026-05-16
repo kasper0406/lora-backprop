@@ -30,6 +30,7 @@ from torch import nn
 import torch.nn.functional as F
 
 from training_methods import (
+    BF16AdamW,
     CompressedBackwardLinear,
     estimate_linear_backward_cost,
     pick_device,
@@ -100,10 +101,17 @@ def bench_cell(method: str, rank: int, args, device) -> BenchResult:
                     basis_refresh_every=args.basis_refresh_every).to(device)
     if args.optimizer == "adamw_fused":
         opt = torch.optim.AdamW(model.parameters(), lr=1e-3, fused=True)
+    elif args.optimizer == "adamw_fused_compiled":
+        opt = torch.optim.AdamW(model.parameters(), lr=1e-3, fused=True)
+        opt.step = torch.compile(opt.step)
+    elif args.optimizer == "bf16_adamw":
+        opt = BF16AdamW(model.parameters(), lr=1e-3)
     elif args.optimizer == "sgd":
         opt = torch.optim.SGD(model.parameters(), lr=1e-3)
     else:
         opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    if args.compile_model:
+        model = torch.compile(model)
 
     # Theoretical accounting over the compressed linears only (full uses nn.Linear).
     if method != "full":
@@ -205,7 +213,11 @@ def main():
     p.add_argument("--batch-size", type=int, default=128)
     p.add_argument("--warmup-steps", type=int, default=10)
     p.add_argument("--bench-steps", type=int, default=30)
-    p.add_argument("--optimizer", choices=["adamw", "adamw_fused", "sgd"], default="adamw_fused")
+    p.add_argument("--optimizer",
+                   choices=["adamw", "adamw_fused", "adamw_fused_compiled", "bf16_adamw", "sgd"],
+                   default="adamw_fused")
+    p.add_argument("--compile-model", action="store_true",
+                   help="wrap the model with torch.compile to fuse forward (and trace backward)")
     p.add_argument("--basis-refresh-every", type=int, default=50,
                    help="refresh the activation-PCA/sketch basis every N forwards; "
                         "high values amortize the eigh/QR cost, which is otherwise dominant")
