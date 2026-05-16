@@ -45,7 +45,8 @@ class _CompressedBackwardLinearFn(torch.autograd.Function):
             grad_b.index_copy_(0, active_idx, flat_grad.sum(dim=0))
         else:
             grad_b = None
-        ctx.module.row_grad_mass.index_add_(0, active_idx, active_grad_w.abs().sum(dim=1))
+        if ctx.module.track_diagnostics:
+            ctx.module.row_grad_mass.index_add_(0, active_idx, active_grad_w.abs().sum(dim=1))
         return grad_x, grad_w, grad_b, None, None
 
 
@@ -113,6 +114,11 @@ class CompressedBackwardLinear(nn.Module):
         self._turnover_n = 0
         self._last_selection_idx: torch.Tensor | None = None
         self.last_turnover = 0.0
+        # Per-step diagnostics (selection_counts, row_grad_mass) cost a real GPU
+        # index_add_ per layer per forward/backward. Off by default so the
+        # speed-critical path stays clean; flip to True via the convenience
+        # helper below before runs where you want stats.
+        self.track_diagnostics = False
 
     def reset_parameters(self):
         nn.init.kaiming_uniform_(self.weight, a=5 ** 0.5)
@@ -139,14 +145,13 @@ class CompressedBackwardLinear(nn.Module):
         # topk indices need no .sort(); index_select/index_copy_ don't require ordering.
         idx = score.topk(self.rank).indices
         self.last_active_fraction = float(self.rank / self.out_features)
-        # Update selection histogram on-device without materializing a bool mask.
-        self.selection_counts.index_add_(
-            0, idx, torch.ones_like(idx, dtype=self.selection_counts.dtype)
-        )
-        self._selection_steps += 1
-        # Turnover is a diagnostic — store the previous idx as a tensor reference and
-        # let selection_stats() compute it on demand (no per-step .item() sync).
-        self._last_selection_idx = idx
+        if self.track_diagnostics:
+            # Update selection histogram on-device without materializing a bool mask.
+            self.selection_counts.index_add_(
+                0, idx, torch.ones_like(idx, dtype=self.selection_counts.dtype)
+            )
+            self._selection_steps += 1
+            self._last_selection_idx = idx
         return idx
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
