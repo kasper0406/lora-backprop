@@ -145,12 +145,15 @@ class CompressedBackwardLinear(nn.Module):
         # topk indices need no .sort(); index_select/index_copy_ don't require ordering.
         idx = score.topk(self.rank).indices
         self.last_active_fraction = float(self.rank / self.out_features)
+        # Always tick the step counter — a cheap Python increment with no GPU work.
+        # The fast ema_topk forward path keys off this counter to know the EMA
+        # buffer is warm and y is unnecessary for scoring.
+        self._selection_steps += 1
         if self.track_diagnostics:
             # Update selection histogram on-device without materializing a bool mask.
             self.selection_counts.index_add_(
                 0, idx, torch.ones_like(idx, dtype=self.selection_counts.dtype)
             )
-            self._selection_steps += 1
             self._last_selection_idx = idx
         return idx
 
@@ -191,14 +194,12 @@ class CompressedBackwardLinear(nn.Module):
                 reduce_dims = tuple(range(out.ndim - 1))
                 energy = out.detach().pow(2).mean(dim=reduce_dims)
                 self.ema_energy.mul_(self.ema_decay).add_(energy, alpha=1 - self.ema_decay)
+                self._selection_steps += 1
                 if self.track_diagnostics:
                     self.selection_counts.index_add_(
                         0, active_idx, torch.ones_like(active_idx, dtype=self.selection_counts.dtype)
                     )
-                    self._selection_steps += 1
                     self._last_selection_idx = active_idx
-                else:
-                    self._selection_steps += 1
             return out
 
         # batch_topk and the first ema_topk step still need y to compute the score.
