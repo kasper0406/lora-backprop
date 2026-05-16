@@ -98,7 +98,12 @@ def bench_cell(method: str, rank: int, args, device) -> BenchResult:
     mode = "full" if method == "full" else method
     model = DeepMLP(args.d_in, args.d_hidden, args.n_layers, args.d_out, use_rank, mode,
                     basis_refresh_every=args.basis_refresh_every).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    if args.optimizer == "adamw_fused":
+        opt = torch.optim.AdamW(model.parameters(), lr=1e-3, fused=True)
+    elif args.optimizer == "sgd":
+        opt = torch.optim.SGD(model.parameters(), lr=1e-3)
+    else:
+        opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
 
     # Theoretical accounting over the compressed linears only (full uses nn.Linear).
     if method != "full":
@@ -200,6 +205,7 @@ def main():
     p.add_argument("--batch-size", type=int, default=128)
     p.add_argument("--warmup-steps", type=int, default=10)
     p.add_argument("--bench-steps", type=int, default=30)
+    p.add_argument("--optimizer", choices=["adamw", "adamw_fused", "sgd"], default="adamw_fused")
     p.add_argument("--basis-refresh-every", type=int, default=50,
                    help="refresh the activation-PCA/sketch basis every N forwards; "
                         "high values amortize the eigh/QR cost, which is otherwise dominant")
