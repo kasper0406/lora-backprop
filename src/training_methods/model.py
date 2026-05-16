@@ -22,6 +22,7 @@ class ModelConfig:
     use_log_skip: bool = False
     compressed_backward_rank: int | None = None
     compressed_backward_mode: str = "full"
+    compressed_backward_basis_refresh_every: int = 1
 
 
 class RMSNorm(nn.Module):
@@ -177,6 +178,7 @@ class GatedDeltaFiLMRAGModel(nn.Module):
                 out_f,
                 rank=min(config.compressed_backward_rank, out_f),
                 mode=config.compressed_backward_mode,
+                basis_refresh_every=config.compressed_backward_basis_refresh_every,
                 bias=bias,
             )
         self.embedding = nn.Embedding(config.vocab_size, config.d_model)
@@ -263,6 +265,13 @@ class GatedDeltaFiLMRAGModel(nn.Module):
                 dense += module.last_dense_backward_flops
                 indexed += module.last_indexed_backward_flops
         return ((sum(active) / len(active)) if active else 1.0, (indexed / dense) if dense else 1.0)
+
+    def selection_stats(self) -> tuple[float, float, float, float]:
+        vals = [module.selection_stats() for module in self.modules() if isinstance(module, CompressedBackwardLinear)]
+        vals = [v for v in vals if v != (0.0, 0.0, 0.0, 0.0)]
+        if not vals:
+            return 0.0, 0.0, 0.0, 0.0
+        return tuple(sum(items) / len(items) for items in zip(*vals))
 
     @torch.no_grad()
     def decide_think_mask(self, input_ids: torch.Tensor, threshold: float = 0.5) -> torch.Tensor:

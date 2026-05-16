@@ -14,7 +14,43 @@ We compare ordinary end-to-end backpropagation with layer-local objectives and b
 
 ### 2. Compressed backward signals
 
-Instead of only compressing the final weight gradient, we now test compressed error messages themselves. `CompressedBackwardLinear` selects a small set of output channels from the forward pass and computes backward updates only through those rows. This gives a real reduction in executed linear-backward FLOPs inside the compressed layers.
+Instead of only compressing the final weight gradient, we now test compressed error messages themselves.
+
+The most important branch is a **LoRA-shaped backward transport rule with full-weight optimization**. For a linear layer,
+
+```text
+forward:  y  = x Wᵀ
+
+choose:   B ∈ R[out × r]      # one rank-r basis in output-channel space,
+                              # chosen from forward activations
+
+compress: z  = dy B
+propagate:dx = z (Bᵀ W)
+update:   dW = B (zᵀ x)
+```
+
+`B` is not a set of selected rows. Its columns are dense directions through the full output-channel space, so every output channel can participate through the low-rank basis. The gradient is low-rank for the current step, but it is lifted back into the full shape of `W`; all original weights remain trainable, and optimizers such as AdamW/BF16AdamW keep state for every original weight.
+
+The repo also keeps a sparse `top-k` baseline, which chooses actual output rows and computes backward updates only through those rows. That baseline is cheaper, but it asks a different question: whether a small coordinate-aligned subset of channels is enough, rather than whether useful credit can travel through a dense low-rank subspace.
+
+#### How this differs from GaLore
+
+GaLore also keeps the original weights full-rank, but it is solving a different problem. GaLore forms the ordinary dense layer gradient first, projects that gradient into a low-rank space for optimizer updates, and stores optimizer state in the projected space to save memory. Its core target is optimizer-state memory reduction. citeturn0academia12
+
+Our low-rank backward branch differs in four ways:
+
+| Question | This repo | GaLore |
+|---|---|---|
+| **When is compression applied?** | Before layer backward work, by compressing `dy` | After the dense gradient has been formed |
+| **What chooses the subspace?** | Forward activations (`activation_pca_lowrank` or sketches) | The gradient itself / its low-rank structure |
+| **What becomes cheaper?** | The layer's backward transport arithmetic: both `dx` and `dW` are formed from rank-r messages | Optimizer memory; dense backward has already happened |
+| **Where does optimizer state live?** | Full optimizer state for every original weight | Low-rank projected optimizer state |
+
+So the cleanest one-line distinction is:
+
+> **GaLore compresses gradients to save optimizer memory; our method compresses the backward message itself to test whether credit assignment can move through a low-rank activation-chosen subspace while preserving full-weight optimizer history.**
+
+GaLore reports full-parameter learning with reduced optimizer-state memory; our current low-rank branch intentionally does **not** claim that memory saving, because preserving full per-weight optimizer state is part of the experiment. citeturn0academia12
 
 ### 3. Recurrent retrieval benchmark
 
@@ -36,6 +72,7 @@ src/training_methods/
   local_depth.py            bounded local-credit experiments
   compressed_backward.py    indexed compressed-backward layers
   sparse_optim.py           row-sparse AdamW prototype
+  quant_optim.py            blockwise int8 AdamW prototype
   activation_projection.py  activation-conditioned gradient projections
 
 examples/

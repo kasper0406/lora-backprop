@@ -3,11 +3,14 @@ from training_methods import (
     CompressedBackwardMLP,
     CompressedMLPConfig,
     GatedDeltaFiLMRAGModel,
+    BF16AdamW,
+    Int8AdamW,
     LocalDepthConfig,
     LocalDepthSequenceModel,
     ModelConfig,
     RelationalReasoningTask,
     RowSparseAdamW,
+    estimate_linear_backward_cost,
 )
 
 
@@ -84,6 +87,46 @@ def test_compressed_backward_mlp_runs() -> None:
     assert 0 < model.active_fraction() <= 1
 
 
+def test_lowrank_backward_mlp_runs() -> None:
+    task = RelationalReasoningTask()
+    batch = task.sample_batch(2)
+    model = CompressedBackwardMLP(CompressedMLPConfig(task.vocab_size, n_layers=2, rank=8, mode="random_lowrank"))
+    logits = model(batch.input_ids, batch.retrieved_ids)
+    loss = logits.sum()
+    loss.backward()
+    assert logits.shape == (2, task.vocab_size)
+    assert 0 < model.active_fraction() <= 1
+    assert model.backward_flop_ratio() > 0
+
+
+def test_sketch_lowrank_backward_mlp_runs() -> None:
+    task = RelationalReasoningTask()
+    batch = task.sample_batch(2)
+    model = CompressedBackwardMLP(CompressedMLPConfig(task.vocab_size, n_layers=2, rank=8, mode="activation_sketch_lowrank"))
+    logits = model(batch.input_ids, batch.retrieved_ids)
+    logits.sum().backward()
+    assert logits.shape == (2, task.vocab_size)
+
+
+def test_lowrank_cost_estimate_keeps_dense_adam_state() -> None:
+    sparse = estimate_linear_backward_cost(
+        token_count=64,
+        in_features=64,
+        out_features=128,
+        rank=16,
+        mode="batch_topk",
+    )
+    lowrank = estimate_linear_backward_cost(
+        token_count=64,
+        in_features=64,
+        out_features=128,
+        rank=16,
+        mode="random_lowrank",
+    )
+    assert sparse.adam_state_ratio < 1
+    assert lowrank.adam_state_ratio == 1
+
+
 def test_row_sparse_adamw_runs() -> None:
     task = RelationalReasoningTask()
     batch = task.sample_batch(2)
@@ -93,6 +136,31 @@ def test_row_sparse_adamw_runs() -> None:
     loss.backward()
     opt.step()
     assert opt.state_numel() > 0
+
+
+def test_int8_adamw_runs_and_uses_fewer_state_bytes() -> None:
+    task = RelationalReasoningTask()
+    batch = task.sample_batch(2)
+    model = CompressedBackwardMLP(CompressedMLPConfig(task.vocab_size, n_layers=2, rank=8, mode="full"))
+    opt = Int8AdamW(model.parameters(), lr=1e-3, block_size=16)
+    loss = model(batch.input_ids, batch.retrieved_ids).sum()
+    loss.backward()
+    opt.step()
+    dense_adam_state_bytes = 2 * sum(p.numel() for p in model.parameters()) * 4
+    assert opt.state_nbytes() > 0
+    assert opt.state_nbytes() < dense_adam_state_bytes
+
+
+def test_bf16_adamw_runs_and_uses_halfish_state_bytes() -> None:
+    task = RelationalReasoningTask()
+    batch = task.sample_batch(2)
+    model = CompressedBackwardMLP(CompressedMLPConfig(task.vocab_size, n_layers=2, rank=8, mode="full"))
+    opt = BF16AdamW(model.parameters(), lr=1e-3)
+    loss = model(batch.input_ids, batch.retrieved_ids).sum()
+    loss.backward()
+    opt.step()
+    dense_adam_state_bytes = 2 * sum(p.numel() for p in model.parameters()) * 4
+    assert 0 < opt.state_nbytes() < dense_adam_state_bytes
 
 
 def test_recurrent_model_with_compressed_backward_runs() -> None:
