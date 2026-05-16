@@ -155,35 +155,79 @@ class CompressedBackwardLinear(nn.Module):
         return idx
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = F.linear(x, self.weight, self.bias)
         token_count = x.numel() // x.shape[-1]
-        # dx and dW each cost roughly 2 * tokens * out * in multiply-add FLOPs.
         self.last_dense_backward_flops = 4 * token_count * self.out_features * self.in_features
-        if self.mode in {"random_lowrank", "activation_pca_lowrank", "activation_sketch_lowrank"} and self.rank < self.out_features:
-            basis = self._lowrank_basis(y)
+
+        if self.mode == "full" or self.rank >= self.out_features:
+            self.last_active_fraction = 1.0
+            self.last_indexed_backward_flops = self.last_dense_backward_flops
+            return F.linear(x, self.weight, self.bias)
+
+        is_lowrank = self.mode in {
+            "random_lowrank", "activation_pca_lowrank", "activation_sketch_lowrank"
+        }
+
+        if is_lowrank:
             self.last_active_fraction = float(self.rank / self.out_features)
-            # z = dyB, B^T W, dx, z^T x, and B(core) respectively.
             self.last_indexed_backward_flops = (
                 2 * token_count * self.out_features * self.rank
                 + 4 * token_count * self.rank * self.in_features
                 + 4 * self.out_features * self.rank * self.in_features
             )
+            basis = self._cached_or_refresh_basis(x)
             return _LowRankBackwardLinearFn.apply(x, self.weight, self.bias, basis)
+
+        # Top-k path. ema_topk uses the cached EMA energy from prior steps as the
+        # score, so this step's y is not needed for selection — we update the EMA
+        # after the autograd Function has computed y. batch_topk needs this step's
+        # y for scoring, so we pay the double-matmul there (rare in practice).
+        if self.mode == "ema_topk" and self._selection_steps > 0:
+            active_idx = self.ema_energy.topk(self.rank).indices
+            self.last_active_fraction = float(self.rank / self.out_features)
+            self.last_indexed_backward_flops = 4 * token_count * active_idx.numel() * self.in_features
+            out = _CompressedBackwardLinearFn.apply(x, self.weight, self.bias, active_idx, self)
+            # Refresh EMA from y (=out), no extra matmul.
+            with torch.no_grad():
+                reduce_dims = tuple(range(out.ndim - 1))
+                energy = out.detach().pow(2).mean(dim=reduce_dims)
+                self.ema_energy.mul_(self.ema_decay).add_(energy, alpha=1 - self.ema_decay)
+                if self.track_diagnostics:
+                    self.selection_counts.index_add_(
+                        0, active_idx, torch.ones_like(active_idx, dtype=self.selection_counts.dtype)
+                    )
+                    self._selection_steps += 1
+                    self._last_selection_idx = active_idx
+                else:
+                    self._selection_steps += 1
+            return out
+
+        # batch_topk and the first ema_topk step still need y to compute the score.
+        y = F.linear(x, self.weight, self.bias)
         active_idx = self._active_idx(y)
         self.last_indexed_backward_flops = 4 * token_count * active_idx.numel() * self.in_features
         return _CompressedBackwardLinearFn.apply(x, self.weight, self.bias, active_idx, self)
 
-    def _lowrank_basis(self, y: torch.Tensor) -> torch.Tensor:
+    def _cached_or_refresh_basis(self, x: torch.Tensor) -> torch.Tensor:
+        """Return the cached basis if still warm; else compute y and refresh."""
         if self.mode == "random_lowrank":
-            return self.random_basis.to(device=y.device, dtype=y.dtype)
+            return self.random_basis.to(device=x.device, dtype=x.dtype)
         if (
             self.cached_basis.numel()
             and self._basis_age < self.basis_refresh_every
-            and self.cached_basis.device == y.device
-            and self.cached_basis.dtype == y.dtype
+            and self.cached_basis.device == x.device
+            and self.cached_basis.dtype == x.dtype
         ):
             self._basis_age += 1
             return self.cached_basis
+        # Need a fresh basis — pay the extra F.linear once per refresh interval.
+        y = F.linear(x, self.weight, self.bias)
+        return self._lowrank_basis(y)
+
+    def _lowrank_basis(self, y: torch.Tensor) -> torch.Tensor:
+        """Compute a fresh basis from y and cache it. Caller is responsible for
+        checking the cache before calling — see _cached_or_refresh_basis."""
+        if self.mode == "random_lowrank":
+            return self.random_basis.to(device=y.device, dtype=y.dtype)
         flat_y = y.detach().reshape(-1, y.shape[-1])
         centered = flat_y - flat_y.mean(dim=0, keepdim=True)
         if self.mode == "activation_sketch_lowrank":
