@@ -40,12 +40,15 @@ class DeepMLP(nn.Module):
     """A clean stack of linear+SiLU layers — no recurrence, no per-token loops."""
 
     def __init__(self, d_in: int, d_hidden: int, n_layers: int, d_out: int,
-                 rank: int | None, mode: str):
+                 rank: int | None, mode: str, basis_refresh_every: int = 50):
         super().__init__()
         def make(in_f: int, out_f: int) -> nn.Module:
             if rank is None or mode == "full":
                 return nn.Linear(in_f, out_f)
-            return CompressedBackwardLinear(in_f, out_f, rank=min(rank, out_f), mode=mode)
+            return CompressedBackwardLinear(
+                in_f, out_f, rank=min(rank, out_f), mode=mode,
+                basis_refresh_every=basis_refresh_every,
+            )
         self.in_proj = make(d_in, d_hidden)
         self.layers = nn.ModuleList()
         for _ in range(n_layers):
@@ -93,7 +96,8 @@ def bench_cell(method: str, rank: int, args, device) -> BenchResult:
 
     use_rank = rank if method != "full" else None
     mode = "full" if method == "full" else method
-    model = DeepMLP(args.d_in, args.d_hidden, args.n_layers, args.d_out, use_rank, mode).to(device)
+    model = DeepMLP(args.d_in, args.d_hidden, args.n_layers, args.d_out, use_rank, mode,
+                    basis_refresh_every=args.basis_refresh_every).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
 
     # Theoretical accounting over the compressed linears only (full uses nn.Linear).
@@ -196,6 +200,9 @@ def main():
     p.add_argument("--batch-size", type=int, default=128)
     p.add_argument("--warmup-steps", type=int, default=10)
     p.add_argument("--bench-steps", type=int, default=30)
+    p.add_argument("--basis-refresh-every", type=int, default=50,
+                   help="refresh the activation-PCA/sketch basis every N forwards; "
+                        "high values amortize the eigh/QR cost, which is otherwise dominant")
     p.add_argument("--output", default="results/wallclock_bench.json")
     args = p.parse_args()
 
