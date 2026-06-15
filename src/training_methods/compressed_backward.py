@@ -114,6 +114,13 @@ class CompressedBackwardLinear(nn.Module):
         self._turnover_n = 0
         self._last_selection_idx: torch.Tensor | None = None
         self.last_turnover = 0.0
+        # Stochastic top-k temperature (Gumbel-top-k). When None the selection is
+        # the deterministic argmax over ema_energy (original behaviour). When set,
+        # the score is eta * log(ema_energy) + Gumbel(0,1) — small eta = diffuse
+        # exploration, large eta -> deterministic. The lightning analogy: this is
+        # the dielectric-breakdown concentration exponent η. Driven externally by
+        # the training loop so it can be annealed across steps.
+        self.eta: float | None = None
         # Per-step diagnostics (selection_counts, row_grad_mass) cost a real GPU
         # index_add_ per layer per forward/backward. Off by default so the
         # speed-critical path stays clean; flip to True via the convenience
@@ -185,7 +192,16 @@ class CompressedBackwardLinear(nn.Module):
         # after the autograd Function has computed y. batch_topk needs this step's
         # y for scoring, so we pay the double-matmul there (rare in practice).
         if self.mode == "ema_topk" and self._selection_steps > 0:
-            active_idx = self.ema_energy.topk(self.rank).indices
+            if self.eta is not None:
+                # Gumbel-top-k sampling over the EMA energy. Equivalent to drawing
+                # k channels without replacement from p_i ∝ ema_energy_i^eta.
+                log_energy = (self.ema_energy + 1e-12).log()
+                u = torch.rand_like(log_energy).clamp_min(1e-12)
+                gumbel = -(-u.log()).clamp_min(1e-12).log()
+                scores = self.eta * log_energy + gumbel
+                active_idx = scores.topk(self.rank).indices
+            else:
+                active_idx = self.ema_energy.topk(self.rank).indices
             self.last_active_fraction = float(self.rank / self.out_features)
             self.last_indexed_backward_flops = 4 * token_count * active_idx.numel() * self.in_features
             out = _CompressedBackwardLinearFn.apply(x, self.weight, self.bias, active_idx, self)

@@ -39,6 +39,24 @@ from training_methods import (
 )
 
 
+def set_eta(model, eta):
+    """Push the stochastic top-k temperature into every CompressedBackwardLinear."""
+    for m in model.modules():
+        if isinstance(m, CompressedBackwardLinear):
+            m.eta = eta
+
+
+def eta_at_step(step: int, total_steps: int, eta_start: float | None, eta_end: float | None):
+    """Linear schedule from eta_start to eta_end over [1, total_steps].
+    Returns None when eta_start is None (deterministic mode = original behaviour)."""
+    if eta_start is None:
+        return None
+    if eta_end is None or total_steps <= 1:
+        return float(eta_start)
+    frac = (step - 1) / (total_steps - 1)
+    return float(eta_start + (eta_end - eta_start) * frac)
+
+
 @dataclass
 class CellResult:
     method: str
@@ -56,6 +74,8 @@ class CellResult:
     opt_state_bytes: int
     wall_clock_s: float
     history: list
+    eta_start: float | None = None
+    eta_end: float | None = None
 
 
 def evaluate(model, task, batch_size, think_steps, device, max_hops):
@@ -128,6 +148,9 @@ def run_cell(method: str, rank: int, seed: int, args, device) -> CellResult:
           f"theory_flop={theory_flop_ratio:.3f}")
 
     for step in range(1, args.steps + 1):
+        eta = eta_at_step(step, args.steps, args.eta_start, args.eta_end)
+        if eta is not None:
+            set_eta(model, eta)
         batch = task.sample_batch(args.batch_size, device=device)
         logits = model(batch.input_ids, batch.retrieved_ids, think_steps=args.think_steps)
         loss = F.cross_entropy(logits[:, -1], batch.target_ids)
@@ -175,6 +198,8 @@ def run_cell(method: str, rank: int, seed: int, args, device) -> CellResult:
         opt_state_bytes=state_bytes,
         wall_clock_s=wall,
         history=history,
+        eta_start=args.eta_start,
+        eta_end=args.eta_end,
     )
 
 
@@ -208,6 +233,10 @@ def main():
     p.add_argument("--lr", type=float, default=2e-3)
     p.add_argument("--basis-refresh-every", type=int, default=10)
     p.add_argument("--log-every", type=int, default=100)
+    p.add_argument("--eta-start", type=float, default=None,
+                   help="Stochastic top-k Gumbel temperature at step 1. None = deterministic argmax (original behaviour)")
+    p.add_argument("--eta-end", type=float, default=None,
+                   help="Stochastic top-k Gumbel temperature at last step. Linear schedule between eta_start and eta_end. None = constant eta_start")
     p.add_argument("--output", default="results/lora_backward_sweep.json")
     p.add_argument("--sanity-only", action="store_true",
                    help="Run only a short dense baseline check to confirm the task is learnable")
